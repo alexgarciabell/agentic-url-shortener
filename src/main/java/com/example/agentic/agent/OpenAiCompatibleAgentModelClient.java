@@ -42,52 +42,305 @@ public class OpenAiCompatibleAgentModelClient implements AgentModelClient {
     }
 
     @Override
-    public AgentResponse execute(String systemPrompt, String userPrompt) {
+    public AgentResponse execute(
+            String systemPrompt,
+            String userPrompt) {
+
         validateConfiguration();
 
-        String serializedRequest;
+        ModelCallException firstFailure;
+
         try {
-            serializedRequest = objectMapper.writeValueAsString(
-                    createRequestBody(systemPrompt, userPrompt));
+            return executeStrict(
+                    systemPrompt,
+                    userPrompt,
+                    false
+            );
+        } catch (ModelCallException exception) {
+            if (!exception.isJsonValidationFailure()) {
+                throw exception;
+            }
+
+            firstFailure = exception;
+        }
+
+        try {
+            return executeStrict(
+                    systemPrompt,
+                    userPrompt,
+                    true
+            );
+        } catch (ModelCallException exception) {
+            if (!exception.isJsonValidationFailure()) {
+                throw exception;
+            }
+        }
+
+        try {
+            return executeJsonObjectFallback(
+                    systemPrompt,
+                    userPrompt
+            );
+        } catch (RuntimeException fallbackFailure) {
+            fallbackFailure.addSuppressed(firstFailure);
+
+            throw new IllegalStateException(
+                    "The model failed strict structured output "
+                            + "and the JSON fallback also failed",
+                    fallbackFailure
+            );
+        }
+    }
+
+    private AgentResponse executeStrict(
+            String systemPrompt,
+            String userPrompt,
+            boolean retry) {
+
+        Map<String, Object> requestBody =
+                createStrictRequestBody(
+                        systemPrompt,
+                        retry
+                                ? createRetryPrompt(userPrompt)
+                                : userPrompt
+                );
+
+        String responseBody = sendRequest(requestBody);
+        String output = extractOutputText(responseBody);
+
+        return deserializeAgentResponse(output);
+    }
+
+    private AgentResponse deserializeAgentResponse(
+            String content) {
+
+        try {
+            return objectMapper.readValue(
+                    content,
+                    AgentResponse.class
+            );
         } catch (JsonProcessingException exception) {
-            throw new IllegalStateException("Unable to serialize model request", exception);
+            throw new IllegalStateException(
+                    "Invalid AgentResponse JSON. Raw output: "
+                            + abbreviate(content),
+                    exception
+            );
+        }
+    }
+
+    private AgentResponse executeJsonObjectFallback(
+            String systemPrompt,
+            String userPrompt) {
+
+        Map<String, Object> requestBody =
+                createJsonObjectRequestBody(
+                        systemPrompt,
+                        userPrompt
+                );
+
+        String responseBody = sendRequest(requestBody);
+        String output = extractOutputText(responseBody);
+        String json = extractJsonObject(output);
+
+        return deserializeAgentResponse(json);
+    }
+
+    private String createRetryPrompt(String originalPrompt) {
+        return """
+        The previous response could not be validated against the
+        required JSON schema.
+
+        Retry the task using the smallest valid set of file operations.
+
+        Requirements:
+        - Return only the required structured result.
+        - Do not include analysis or explanations.
+        - Do not repeat files that do not require changes.
+        - Include complete content only for files that must be written.
+        - Prefer modifying production code and creating one focused
+          regression test.
+        - Do not modify existing tests.
+        - Use an empty content string for DELETE operations.
+        - Keep summary, rationale, and assumptions concise.
+
+        Original task:
+
+        %s
+        """.formatted(originalPrompt);
+    }
+
+    private String strictSystemPrompt(String suppliedPrompt) {
+        return """
+        %s
+
+        Return exactly one structured response matching the supplied
+        JSON schema.
+
+        Do not include:
+        - Markdown
+        - code fences
+        - analysis
+        - chain-of-thought
+        - introductions
+        - comments outside the structured response
+        Minimize the number of file operations.
+        - Existing tests are read-only.
+        - Create a new test class when regression coverage is needed.
+        """.formatted(
+                suppliedPrompt == null ? "" : suppliedPrompt.trim()
+        );
+    }
+
+    private String jsonFallbackSystemPrompt(
+            String suppliedPrompt) {
+
+        return """
+        %s
+
+        Return only one valid JSON object with this exact shape:
+
+        {
+          "summary": "string",
+          "rationale": "string",
+          "assumptions": ["string"],
+          "operations": [
+            {
+              "operation": "WRITE or DELETE",
+              "path": "relative/path",
+              "content": "complete content or empty for DELETE"
+            }
+          ]
+        }
+
+        The first character must be {
+        The last character must be }
+        """.formatted(
+                suppliedPrompt == null
+                        ? ""
+                        : suppliedPrompt.trim()
+        );
+    }
+
+    private String sendRequest(
+            Map<String, Object> requestBody) {
+
+        String serializedRequest;
+
+        try {
+            serializedRequest =
+                    objectMapper.writeValueAsString(requestBody);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException(
+                    "Unable to serialize model request",
+                    exception
+            );
         }
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(resolveResponsesEndpoint())
                 .timeout(REQUEST_TIMEOUT)
-                .header("Authorization", "Bearer " + properties.getModel().getApiKey())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(serializedRequest))
+                .header(
+                        "Authorization",
+                        "Bearer "
+                                + properties.getModel().getApiKey()
+                )
+                .header(
+                        "Content-Type",
+                        "application/json"
+                )
+                .header(
+                        "Accept",
+                        "application/json"
+                )
+                .POST(
+                        HttpRequest.BodyPublishers.ofString(
+                                serializedRequest
+                        )
+                )
                 .build();
 
         HttpResponse<String> response;
+
         try {
-            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString()
+            );
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Model execution was interrupted", exception);
+
+            throw new IllegalStateException(
+                    "Model request interrupted",
+                    exception
+            );
         } catch (IOException exception) {
             throw new IllegalStateException(
-                    "Model connection failed: " + exception.getMessage(), exception);
+                    "Unable to connect to model provider: "
+                            + exception.getMessage(),
+                    exception
+            );
         }
 
         if (response.statusCode() / 100 != 2) {
-            throw new IllegalStateException("Model HTTP %d: %s".formatted(
-                    response.statusCode(), abbreviate(response.body())));
+            throw createModelCallException(
+                    response.statusCode(),
+                    response.body()
+            );
         }
 
-        String rawModelContent = extractOutputText(response.body());
-        String jsonContent = extractJsonObject(rawModelContent);
+        return response.body();
+    }
+
+    private ModelCallException createModelCallException(
+            int statusCode,
+            String responseBody) {
+
+        String errorCode = null;
+        String errorMessage = null;
+        String failedGeneration = null;
 
         try {
-            return objectMapper.readValue(jsonContent, AgentResponse.class);
-        } catch (JsonProcessingException exception) {
-            throw new IllegalStateException(
-                    "Model returned an invalid AgentResponse. Raw output: "
-                            + abbreviate(rawModelContent), exception);
+            JsonNode root =
+                    objectMapper.readTree(responseBody);
+
+            JsonNode error = root.path("error");
+
+            errorCode = textOrNull(
+                    error.path("code")
+            );
+
+            errorMessage = textOrNull(
+                    error.path("message")
+            );
+
+            failedGeneration = textOrNull(
+                    error.path("failed_generation")
+            );
+        } catch (JsonProcessingException ignored) {
+            // Preserve the raw body below.
         }
+
+        return new ModelCallException(
+                statusCode,
+                errorCode,
+                errorMessage,
+                failedGeneration,
+                abbreviate(responseBody)
+        );
+    }
+
+    private String textOrNull(JsonNode node) {
+        if (node == null
+                || node.isMissingNode()
+                || node.isNull()) {
+            return null;
+        }
+
+        if (node.isTextual()) {
+            return node.asText();
+        }
+
+        return node.toString();
     }
 
     private Map<String, Object> createRequestBody(String systemPrompt, String userPrompt) {
@@ -96,6 +349,98 @@ public class OpenAiCompatibleAgentModelClient implements AgentModelClient {
         body.put("instructions", normalizeSystemPrompt(systemPrompt));
         body.put("input", normalizeUserPrompt(userPrompt));
         body.put("text", Map.of("format", createResponseFormat()));
+        return body;
+    }
+
+    private Map<String, Object> createStrictRequestBody(
+            String systemPrompt,
+            String userPrompt) {
+
+        Map<String, Object> body = new LinkedHashMap<>();
+
+        body.put(
+                "model",
+                properties.getModel().getModel()
+        );
+
+        body.put(
+                "instructions",
+                strictSystemPrompt(systemPrompt)
+        );
+
+        body.put(
+                "input",
+                userPrompt
+        );
+
+        body.put(
+                "temperature",
+                0.1
+        );
+
+        body.put(
+                "max_output_tokens",
+                32_000
+        );
+
+        body.put(
+                "text",
+                Map.of(
+                        "format",
+                        Map.of(
+                                "type", "json_schema",
+                                "name", "agent_response",
+                                "strict", true,
+                                "schema", createAgentResponseSchema()
+                        )
+                )
+        );
+
+        return body;
+    }
+
+    private Map<String, Object> createJsonObjectRequestBody(
+            String systemPrompt,
+            String userPrompt) {
+
+        Map<String, Object> body = new LinkedHashMap<>();
+
+        body.put(
+                "model",
+                properties.getModel().getModel()
+        );
+
+        body.put(
+                "instructions",
+                jsonFallbackSystemPrompt(systemPrompt)
+        );
+
+        body.put(
+                "input",
+                userPrompt
+        );
+
+        body.put(
+                "temperature",
+                0.1
+        );
+
+        body.put(
+                "max_output_tokens",
+                32_000
+        );
+
+        body.put(
+                "text",
+                Map.of(
+                        "format",
+                        Map.of(
+                                "type",
+                                "json_object"
+                        )
+                )
+        );
+
         return body;
     }
 
@@ -221,27 +566,62 @@ public class OpenAiCompatibleAgentModelClient implements AgentModelClient {
                         + abbreviate(responseBody));
     }
 
-    String extractJsonObject(String content) {
+//    String extractJsonObject(String content) {
+//        if (content == null || content.isBlank()) {
+//            throw new IllegalStateException("Model returned empty content");
+//        }
+//        String trimmed = content.trim();
+//        if (trimmed.startsWith("```json")) {
+//            trimmed = trimmed.substring(7);
+//        } else if (trimmed.startsWith("```")) {
+//            trimmed = trimmed.substring(3);
+//        }
+//        if (trimmed.endsWith("```")) {
+//            trimmed = trimmed.substring(0, trimmed.length() - 3);
+//        }
+//        trimmed = trimmed.trim();
+//        int start = trimmed.indexOf('{');
+//        int end = trimmed.lastIndexOf('}');
+//        if (start < 0 || end < start) {
+//            throw new IllegalStateException(
+//                    "Model returned no JSON object: " + abbreviate(content));
+//        }
+//        return trimmed.substring(start, end + 1);
+//    }
+
+    private String extractJsonObject(String content) {
         if (content == null || content.isBlank()) {
-            throw new IllegalStateException("Model returned empty content");
+            throw new IllegalStateException(
+                    "Model returned empty content"
+            );
         }
-        String trimmed = content.trim();
-        if (trimmed.startsWith("```json")) {
-            trimmed = trimmed.substring(7);
-        } else if (trimmed.startsWith("```")) {
-            trimmed = trimmed.substring(3);
+
+        String value = content.trim();
+
+        if (value.startsWith("```json")) {
+            value = value.substring(7).trim();
+        } else if (value.startsWith("```")) {
+            value = value.substring(3).trim();
         }
-        if (trimmed.endsWith("```")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 3);
+
+        if (value.endsWith("```")) {
+            value = value.substring(
+                    0,
+                    value.length() - 3
+            ).trim();
         }
-        trimmed = trimmed.trim();
-        int start = trimmed.indexOf('{');
-        int end = trimmed.lastIndexOf('}');
+
+        int start = value.indexOf('{');
+        int end = value.lastIndexOf('}');
+
         if (start < 0 || end < start) {
             throw new IllegalStateException(
-                    "Model returned no JSON object: " + abbreviate(content));
+                    "Model response contains no JSON object: "
+                            + abbreviate(content)
+            );
         }
-        return trimmed.substring(start, end + 1);
+
+        return value.substring(start, end + 1);
     }
 
     private void validateConfiguration() {

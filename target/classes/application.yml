@@ -25,8 +25,8 @@ agent:
     mode: ${AGENT_MODEL_MODE:demo}
     base-url: ${OPENAI_BASE_URL:https://api.groq.com/openai/v1}
     api-key: ${OPENAI_API_KEY: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}
-    #    model: ${OPENAI_MODEL:llama-3.3-70b-versatile}
-    model: ${OPENAI_MODEL:openai/gpt-oss-120b}
+    model: ${OPENAI_MODEL:llama-3.3-70b-versatile}
+#    model: ${OPENAI_MODEL:openai/gpt-oss-20b}
   deployment:
     port-start: 8090
     port-end: 8190
