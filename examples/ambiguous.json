@@ -1,0 +1,5 @@
+{
+  "scenarioType": "AMBIGUOUS",
+  "requirement": "Make shortened URLs safer.",
+  "workspacePath": "./workspaces/ambiguous-url-shortener"
+}

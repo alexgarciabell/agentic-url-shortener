@@ -1,0 +1,33 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:h2:file:./data/agentic-db
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: update
+  h2:
+    console:
+      enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+agent:
+  max-repair-attempts: 3
+  model:
+    mode: ${AGENT_MODEL_MODE:demo}
+    base-url: ${OPENAI_BASE_URL:https://api.groq.com/openai/v1}
+    api-key: ${OPENAI_API_KEY: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}
+    #    model: ${OPENAI_MODEL:llama-3.3-70b-versatile}
+    model: ${OPENAI_MODEL:openai/gpt-oss-120b}
+  deployment:
+    port-start: 8090
+    port-end: 8190
+    startup-timeout: 30s

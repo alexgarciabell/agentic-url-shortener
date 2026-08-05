@@ -1,0 +1,5 @@
+{
+  "scenarioType": "BROWNFIELD",
+  "requirement": "Fix expired URL access so it returns HTTP 410 and does not increment successful redirect analytics.",
+  "workspacePath": "./workspaces/existing-url-shortener"
+}
