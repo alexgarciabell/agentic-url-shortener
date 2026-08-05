@@ -318,7 +318,6 @@ Passing tests is therefore not equivalent to proving the generated code is secur
 
 - Keeps the orchestration logic visible to reviewers.
 - Minimizes infrastructure and setup.
-- Fits a two-to-three-day prototype.
 - Makes scenario and safety behavior easy to explain.
 
 **Costs:**
